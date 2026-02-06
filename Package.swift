@@ -5,11 +5,16 @@ import PackageDescription
 
 let package = Package(
     name: "ApusMediaSrv",
+    platforms: [.macOS(.v26)],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
             name: "ApusMediaSrv",
             targets: ["ApusMediaSrv"]
+        ),
+        .executable(
+            name: "ApusMediaServer",
+            targets: ["ApusMediaServer"]
         ),
     ],
     targets: [
@@ -17,6 +22,10 @@ let package = Package(
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
             name: "ApusMediaSrv"
+        ),
+        .executableTarget(
+            name: "ApusMediaServer",
+            dependencies: ["ApusMediaSrv"]
         ),
         .testTarget(
             name: "ApusMediaSrvTests",
