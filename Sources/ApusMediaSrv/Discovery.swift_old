@@ -3,16 +3,14 @@ import Network
 
 public protocol DiscoveryDelegate: AnyObject {
     func discovery(service: Discovery, didReceive cp: String, from endpoint: NWEndpoint)
-
 }
 
 public actor Discovery {
     private var connectionGroup: NWConnectionGroup?
     private let host: NWEndpoint.Host = "239.255.255.250"
     private let port: NWEndpoint.Port = 1900
-    private let queue: DispatchQueue = DispatchQueue(label: "com.jackalworks.discovery")
-
-    public weak var delegate: (any DiscoveryDelegate)?
+    private let queue: DispatchQueue = DispatchQueue(label: "com.jackalworks.apus-media.discovery")
+    private weak var delegate: (any DiscoveryDelegate)?
 
     public init() {}
 
@@ -22,22 +20,17 @@ public actor Discovery {
 
     public func start() throws {
         guard connectionGroup == nil else { return }
-
         let endpoint: NWEndpoint = NWEndpoint.hostPort(host: host, port: port)
         let multicastGroup: NWMulticastGroup = try NWMulticastGroup(for: [endpoint])
-
         let parameters: NWParameters = NWParameters.udp
         parameters.allowLocalEndpointReuse = true
-
         let group: NWConnectionGroup = NWConnectionGroup(with: multicastGroup, using: parameters)
-
         group.setReceiveHandler(maximumMessageSize: 65_507, rejectOversizedMessages: true) {
             [weak self] (message, content, isComplete) in
-            guard let self else { return }
-            guard isComplete, let content else { return }
-            Task { await self.handleMessage(content, from: message) }
+            guard let self, isComplete, let content else { return }
+            let aSelf = self
+            Task { await aSelf.handleMessage(content, from: message) }
         }
-
         group.start(queue: queue)
         connectionGroup = group
     }
@@ -52,6 +45,14 @@ public actor Discovery {
             "NOTIFY * HTTP/1.1\r\n" + "HOST: \(host):\(port)\r\n"
             + "CACHE-CONTROL: max-age=1800\r\n" + "LOCATION: \(location)\r\n" + "NT: \(nt)\r\n"
             + "NTS: ssdp:alive\r\n" + "SERVER: \(server)\r\n" + "USN: \(usn)\r\n" + "\r\n"
+        send(message: message)
+    }
+
+    public func byebye(usn: String, nt: String) {
+        let message =
+            "NOTIFY * HTTP/1.1\r\n" + "HOST: \(host):\(port)\r\n"
+            + "NT: \(nt)\r\n"
+            + "NTS: ssdp:byebye\r\n" + "USN: \(usn)\r\n" + "\r\n"
         send(message: message)
     }
 
@@ -72,10 +73,8 @@ public actor Discovery {
     private func handleMessage(_ data: Data, from message: NWConnectionGroup.Message) async {
         guard let str = String(data: data, encoding: .utf8) else { return }
         guard str.uppercased().hasPrefix("M-SEARCH") else { return }
-
         let lines = str.components(separatedBy: "\r\n")
         var st: String?
-
         for line in lines {
             let parts = line.split(separator: ":", maxSplits: 1).map({
                 $0.trimmingCharacters(in: .whitespaces)
@@ -85,10 +84,8 @@ public actor Discovery {
                 break
             }
         }
-
         guard let target = st else { return }
         guard let endpoint = message.remoteEndpoint else { return }
-
         let delegate = self.delegate
         delegate?.discovery(service: self, didReceive: target, from: endpoint)
     }

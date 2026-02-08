@@ -1,0 +1,173 @@
+import Foundation
+import Network
+
+public class Server: @unchecked Sendable {
+    private let port: NWEndpoint.Port
+    private var listener: NWListener?
+    private var dataBuffers: [ObjectIdentifier: Data] = [:]
+    private let queue = DispatchQueue(label: "com.jackalworks.apus-media.server")
+    public typealias RequestHandler = (Request) -> Response
+    public let requestHandler: RequestHandler?
+
+    public init(port: UInt16, requestHandler: RequestHandler? = nil) {
+        self.port = NWEndpoint.Port(integerLiteral: port)
+        self.requestHandler = requestHandler
+    }
+
+    public func start() throws {
+        let listener: NWListener = try NWListener(using: .tcp, on: port)
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self else { return }
+            connection.start(queue: self.queue)
+            self.receive(on: connection)
+        }
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                print("Server listening on port \(listener.port ?? 0)")
+            case .failed(let error):
+                print("Listener failed: \(error)")
+            default:
+                break
+            }
+        }
+        listener.start(queue: queue)
+        self.listener = listener
+    }
+
+    private func receive(on connection: NWConnection) {
+        connection.receive(
+            minimumIncompleteLength: 1, maximumLength: 65535
+        ) {
+            [weak self] data, context, isComplete, error in
+            guard let self = self else { return }
+            if let data = data, !data.isEmpty {
+                self.processData(data, from: connection)
+            }
+            if isComplete {
+                self.close(connection: connection)
+            } else if let error = error {
+                print("Connection error: \(error)")
+                self.close(connection: connection)
+            } else {
+                self.receive(on: connection)
+            }
+        }
+    }
+
+    private func processData(_ data: Data, from connection: NWConnection) {
+        let id = ObjectIdentifier(connection)
+        var buffer = dataBuffers[id] ?? Data()
+        buffer.append(data)
+        dataBuffers[id] = buffer
+        if buffer.range(of: Data("\r\n\r\n".utf8)) != nil {
+            var remoteHost: String?
+            if case .hostPort(let host, _) = connection.currentPath?.remoteEndpoint {
+                remoteHost = "\(host)"
+            }
+            if let request = Request(data: buffer, remoteHost: remoteHost) {
+                dataBuffers[id] = nil
+                let response: Response
+                if let handler = self.requestHandler {
+                    response = handler(request)
+                } else {
+                    response = Response(statusCode: 404, statusText: "Not Found", body: Data())
+                }
+                self.send(response: response, isHead: request.method == "HEAD", on: connection)
+            }
+        }
+    }
+
+    private func send(response: Response, isHead: Bool, on connection: NWConnection) {
+        connection.send(
+            content: response.serializedData(isHead: isHead),
+            completion: .contentProcessed({ [weak self] error in
+                if let error = error {
+                    print("Send error: \(error)")
+                }
+                self?.close(connection: connection)
+            }))
+    }
+
+    private func close(connection: NWConnection) {
+        connection.cancel()
+        dataBuffers.removeValue(forKey: ObjectIdentifier(connection))
+    }
+}
+
+public struct Request {
+    public let method: String
+    public let path: String
+    public let headers: [String: String]
+    public let body: Data?
+    public let remoteHost: String?
+
+    init?(data: Data, remoteHost: String? = nil) {
+        self.remoteHost = remoteHost
+        guard let str = String(data: data, encoding: .utf8) else { return nil }
+        guard let sep = str.range(of: "\r\n\r\n") else { return nil }
+        let headerPart = String(str[str.startIndex..<sep.lowerBound])
+        let bodyPart = String(str[sep.upperBound...])
+        let headerLines = headerPart.components(separatedBy: "\r\n")
+        guard let requestLine = headerLines.first else { return nil }
+        let requestParts = requestLine.components(separatedBy: " ")
+        guard requestParts.count >= 2 else { return nil }
+        method = requestParts[0]
+        path = requestParts[1]
+        var headers = [String: String]()
+        for line in headerLines.dropFirst() {
+            let parts = line.split(separator: ":", maxSplits: 1).map({
+                $0.trimmingCharacters(in: .whitespaces)
+            })
+            if parts.count == 2 {
+                headers[parts[0].lowercased()] = parts[1]
+            }
+        }
+        self.headers = headers
+        self.body = bodyPart.isEmpty ? nil : bodyPart.data(using: .utf8)
+    }
+
+}
+
+public struct Response {
+    public let statusCode: Int
+    public let statusText: String
+    public let headers: [String: String]
+    public let body: Data
+
+    init(statusCode: Int, statusText: String, headers: [String: String] = [:], body: Data = Data())
+    {
+        self.statusCode = statusCode
+        self.statusText = statusText
+        self.headers = headers
+        self.body = body
+    }
+
+    init(statusCode: Int, statusText: String, headers: [String: String] = [:], str: String) {
+        self.statusCode = statusCode
+        self.statusText = statusText
+        self.headers = headers
+        self.body = str.data(using: .utf8) ?? Data()
+    }
+
+    public var data: Data {
+        return serializedData(isHead: false)
+    }
+
+    public func serializedData(isHead: Bool) -> Data {
+        var header = "HTTP/1.1 \(statusCode) \(statusText)\r\n"
+        header += "Date: \(Date().formatted(.http))\r\n"
+        header += "Content-Length: \(body.count)\r\n"
+        header += "Connection: close\r\n"
+        for (key, value) in headers {
+            header += "\(key): \(value)\r\n"
+        }
+        header += "\r\n"
+        var data = header.data(using: .utf8) ?? Data()
+        if !isHead {
+            data.append(body)
+        }
+        return data
+    }
+
+}
