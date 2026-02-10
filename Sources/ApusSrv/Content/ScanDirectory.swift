@@ -47,7 +47,7 @@ public actor ScanDirectory {
         items[id]
     }
 
-    public func scan(directory: String, parentID: String = "Root") throws {
+    public func scan(directory: String, parentID: String = "Root") async throws {
         let fm: FileManager = FileManager.default
         let contents: [String] = try fm.contentsOfDirectory(atPath: directory)
         for name: String in contents.sorted() {
@@ -63,12 +63,17 @@ public actor ScanDirectory {
                     isContainer: true
                 )
                 addItem(folder)
-                try scan(directory: fullPath, parentID: id)
+                try await scan(directory: fullPath, parentID: id)
             } else {
-                let mime: String? = Self.matchMIME(name)
-                guard let mime: String else { continue }
+                guard let mime: String = Self.matchMIME(name) else { continue }
                 let attributes: [FileAttributeKey: Any] = try fm.attributesOfItem(atPath: fullPath)
                 let size: UInt64? = attributes[.size] as? UInt64
+                var codec: VideoCodec?
+                var duration: Double?
+                if mime.hasPrefix("video") {
+                    codec = await FindCodec.videoCodec(atPath: fullPath)
+                    duration = await FindCodec.duration(atPath: fullPath)
+                }
                 let item: MediaItem = MediaItem(
                     id: id,
                     parentID: parentID,
@@ -76,7 +81,9 @@ public actor ScanDirectory {
                     isContainer: false,
                     mimeType: mime,
                     filePath: fullPath,
-                    size: size
+                    size: size,
+                    duration: duration,
+                    videoCodec: codec
                 )
                 addItem(item)
             }

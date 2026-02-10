@@ -3,13 +3,14 @@ import Foundation
 public actor MediaServer {
     private let device: DeviceDescription
     private let discovery: Discovery
-    private let server: Server
     private let content: ScanDirectory
     private let subscriptions: SubscriptionManager
     private let transcoder: Transcoder
+    private var server: Server?
 
     private let port: UInt16
     private var discoveryTask: Task<Void, Never>?
+    private var localAddress: String = "0.0.0.0"
 
     public init(friendlyName: String = "Media Server", port: UInt16 = 8080) {
         self.port = port
@@ -24,10 +25,12 @@ public actor MediaServer {
         self.content = ScanDirectory()
         self.subscriptions = SubscriptionManager()
         self.transcoder = Transcoder()
-        self.server = Server(port: port) { _ in .notFound }
+        //        self.server = Server(port: port) { _ in .notFound }
     }
 
     public func start(path: String) async throws {
+        guard let ip: String = Interface.localIPv4Address() else { return }
+        self.localAddress = ip
         try await content.scan(directory: path)
         let mediaServer: MediaServer = self
         let server: Server = Server(port: port) { request in
@@ -35,9 +38,9 @@ public actor MediaServer {
         }
         try await server.start()
         try await discovery.start()
-        let eventStream: AsyncStream<DiscoveryEvent> = await discovery.events()
+        let events: AsyncStream<DiscoveryEvent> = await discovery.events()
         discoveryTask = Task {
-            for await event in eventStream {
+            for await event in events {
                 await mediaServer.handleDiscoveryEvent(event)
             }
         }
@@ -50,7 +53,8 @@ public actor MediaServer {
         discoveryTask?.cancel()
         discoveryTask = nil
         await discovery.stop()
-        await server.stop()
+        await server?.stop()
+        server = nil
         print("ApusDLNA stopped")
     }
 
@@ -111,10 +115,10 @@ public actor MediaServer {
     }
 
     private func handleBrowse(_ object: ObjectRequest) async -> Response {
-        let objectID: String = object.arguments["ObjectID"] ?? "0"
+        let objectID: String = object.arguments["ObjectID"] ?? "Root"
         let flag: String = object.arguments["BrowseFlag"] ?? "BrowseDirectChildren"
-        let start: Int = Int(object.arguments["StartingIndex"] ?? "0") ?? 0
-        let count: Int = Int(object.arguments["RequestedCount"] ?? "0") ?? 0
+        let start: Int = Int(object.arguments["StartingIndex"] ?? "Root") ?? 0
+        let count: Int = Int(object.arguments["RequestedCount"] ?? "Root") ?? 0
 
         let (items, total) = await content.browse(
             objectID: objectID,
@@ -146,20 +150,20 @@ public actor MediaServer {
         else {
             return .notFound
         }
-        let fm: FileManager = FileManager.default
-        guard fm.fileExists(atPath: filePath) else { return .notFound }
+        guard FileManager.default.fileExists(atPath: filePath) else { return .notFound }
         // TODO we need to check codec of video stream
-        if false {
-            let stream: AsyncStream<Data> = await transcoder.transcode(
+        if item.needsTranscode {
+            let stream = await transcoder.transcode(
                 path: filePath,
-                profile: .av01
+                codec: .av01
             )
             return Response(
                 code: 200,
                 reason: "OK",
                 headers: [
-                    "Content-Type": "video/mp2t",
+                    "Content-Type": "video/mp4",
                     "Transfer-Encoding": "chunked",
+                    "transferMode.dlna.org": "Streaming",
                 ],
                 body: .stream(stream)
             )
@@ -306,7 +310,7 @@ public actor MediaServer {
     }
 
     private func baseURL() -> String {
-        "http://192.168.1.100:\(port)"
+        "http://\(localAddress):\(port)"
     }
 
     private func buildMetadata(items: [MediaItem]) -> String {

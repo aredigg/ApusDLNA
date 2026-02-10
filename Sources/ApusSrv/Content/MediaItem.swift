@@ -6,7 +6,9 @@ public struct MediaItem: Sendable {
     public let mimeType: String?
     public let filePath: String?
     public let size: UInt64?
-    public let duration: String?
+    public let duration: Double?
+    public let videoCodec: VideoCodec?
+    public var needsTranscode: Bool { videoCodec?.needsTranscode ?? false }
 
     public init(
         id: String,
@@ -16,7 +18,8 @@ public struct MediaItem: Sendable {
         mimeType: String? = nil,
         filePath: String? = nil,
         size: UInt64? = nil,
-        duration: String? = nil
+        duration: Double? = nil,
+        videoCodec: VideoCodec? = nil
     ) {
         self.id = id
         self.parentID = parentID
@@ -26,5 +29,6 @@ public struct MediaItem: Sendable {
         self.filePath = filePath
         self.size = size
         self.duration = duration
+        self.videoCodec = videoCodec
     }
 }
