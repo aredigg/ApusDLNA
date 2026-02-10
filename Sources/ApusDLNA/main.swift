@@ -1,4 +1,4 @@
-import ApusMediaSrv
+import ApusSrv
 import Foundation
 
-let server = await MediaServer()
+let server: MediaServer = MediaServer(path: ".")

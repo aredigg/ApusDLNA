@@ -1,3 +1,5 @@
+import Foundation
+
 public actor MediaServer {
     private let device: DeviceDescription
     private let discovery: Discovery
@@ -9,12 +11,14 @@ public actor MediaServer {
     private let port: UInt16
     private var discoveryTask: Task<Void, Never>?
 
-    public init(friendlyName: String = "Apus DLNA", port: UInt16 = 8080, path: String) {
+    public init(friendlyName: String = "Apus Media Server", port: UInt16 = 8080, path: String) {
         self.port = port
         let uuid = UUID().uuidString
         self.device = DeviceDescription(
             uuid: uuid,
             friendlyName: friendlyName,
+            manufacturer: "Jackalworks",
+            modelName: "ApusDLNA"
         )
         self.discovery = Discovery()
         self.content = ScanDirectory()
