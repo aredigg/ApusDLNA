@@ -96,6 +96,7 @@ public actor ScanDirectory {
                     width: width,
                     height: height,
                 )
+                print(item)
                 addItem(item)
             }
         }

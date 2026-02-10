@@ -1297,4 +1297,11 @@ public actor MediaServer {
         escapeXML(str)
             .replacingOccurrences(of: "\"", with: "&quot;")
     }
+
+    static func intToASCII(_ n: FourCharCode) -> String {
+        withUnsafeBytes(of: UInt32(truncatingIfNeeded: n).bigEndian) { bytes in
+            String(decoding: bytes, as: UTF8.self)
+        }
+    }
+
 }

@@ -32,6 +32,7 @@ public actor Transcoder {
         continuation: AsyncStream<Data>
             .Continuation
     ) async throws {
+        print("performTranscode")
         let asset = AVURLAsset(url: inputURL)
 
         guard
@@ -91,7 +92,9 @@ public actor Transcoder {
 
         let targetBitRate: Int =
             switch codec {
-            case .h264:
+            case .av01:
+                dataRate > 0 ? Int(dataRate) : 5_000_000
+            case .hevc:
                 dataRate > 0 ? Int(dataRate) : 5_000_000
             default:
                 0
@@ -132,11 +135,13 @@ public actor Transcoder {
         }
 
         reader.startReading()
+        print(reader.error.debugDescription)
         writer.startWriting()
+        print(writer.error.debugDescription)
         writer.startSession(atSourceTime: .zero)
 
         let queue = DispatchQueue(
-            label: "com.transcoder.media",
+            label: "com.jackalworks.apus-media.transcoder",
             qos: .userInitiated
         )
 

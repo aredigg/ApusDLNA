@@ -6,8 +6,10 @@ public enum AudioCodec: Sendable, Equatable {
     case other(FourCharCode)
 
     public init(codecType: FourCharCode) {
-        print(codecType)
+        print(MediaServer.intToASCII(codecType))
         switch codecType {
+        case 0x6161_6320:
+            self = .aac
         default:
             self = .other(codecType)
         }

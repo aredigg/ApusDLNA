@@ -15,6 +15,7 @@ public enum VideoCodec: Sendable, Equatable {
     }
 
     public init(codecType: FourCharCode) {
+        print(MediaServer.intToASCII(codecType))
         switch codecType {
         case kCMVideoCodecType_H264:
             self = .h264
@@ -26,4 +27,5 @@ public enum VideoCodec: Sendable, Equatable {
             self = .other(codecType)
         }
     }
+
 }
