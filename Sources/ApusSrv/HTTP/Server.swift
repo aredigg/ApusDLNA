@@ -50,8 +50,7 @@ public actor Server {
                 let (data, isComplete) = try await readOnce(from: connection)
                 if let data: Data, !data.isEmpty {
                     if let response: Response = await processData(data, from: connection) {
-                        let isHead: Bool =
-                            await parseMethod(for: connection)?.uppercased() == "HEAD"
+                        let isHead: Bool = parseMethod(for: connection)?.uppercased() == "HEAD"
                         await send(response: response, isHead: isHead, on: connection)
                         return
                     }
