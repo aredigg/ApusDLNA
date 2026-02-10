@@ -19,9 +19,9 @@ public actor Server {
         guard listener == nil else { return }
         let listener: NWListener = try NWListener(using: .tcp, on: port)
         listener.newConnectionHandler = { [weak self] connection in
-            guard let self: Server else { return }
+            guard let self else { return }
             connection.start(queue: self.queue)
-            //Task { await self.accept(connection) }
+            Task { await self.accept(connection) }
         }
         listener.stateUpdateHandler = { state in
             switch state {
@@ -65,6 +65,7 @@ public actor Server {
 
     private func readOnce(from connection: NWConnection) async throws -> (Data?, Bool) {
         try await withCheckedThrowingContinuation({ continuation in
+            print("\u{001B}[93mhttp.readOnce:\n\("")\u{001B}[0m")
             connection.receive(
                 minimumIncompleteLength: 1, maximumLength: 65535
             ) {
@@ -94,6 +95,7 @@ public actor Server {
     }
 
     private func parseMethod(for connection: NWConnection) -> String? {
+        print("\u{001B}[93mhttp.parseMethod:\n\("")\u{001B}[0m")
         let id: ObjectIdentifier = ObjectIdentifier(connection)
         guard let buffer: Data = buffers[id],
             let str: String = String(data: buffer, encoding: .utf8),
@@ -104,6 +106,7 @@ public actor Server {
 
     private func parse(data: Data, remoteEndpoint: NWEndpoint?) -> Request? {
         guard let str: String = String(data: data, encoding: .utf8) else { return nil }
+        print("\u{001B}[91mhttp.parse:\n\(str)\u{001B}[0m")
         guard let sep: Range<String.Index> = str.range(of: "\r\n\r\n") else { return nil }
         let headerPart: String = String(str[..<sep.lowerBound])
         let bodyPart: Data = Data(str[sep.upperBound...].utf8)
@@ -128,6 +131,7 @@ public actor Server {
 
     private func send(response: Response, isHead: Bool, on connection: NWConnection) async {
         let headerData: Data = serializeHeaders(for: response)
+        print("\u{001B}[92mhttp.send:\n\(headerData)\u{001B}[0m")
         await writeBytes(headerData, to: connection)
         if !isHead {
             switch response.body {
@@ -152,6 +156,7 @@ public actor Server {
     }
 
     private func close(_ connection: NWConnection) {
+        print("\u{001B}[93mhttp.close:\n\("")\u{001B}[0m")
         connection.cancel()
         buffers.removeValue(forKey: ObjectIdentifier(connection))
 

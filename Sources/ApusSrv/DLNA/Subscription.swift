@@ -5,4 +5,5 @@ public struct Subscription: Sendable {
     public let callbackURL: String
     public let timeout: TimeInterval
     public let createdAt: Date
+    public let seq: UInt32
 }

@@ -14,3 +14,5 @@ struct ApusDLNAMain {
         await mediaServer.stop()
     }
 }
+
+try await ApusDLNAMain.main()

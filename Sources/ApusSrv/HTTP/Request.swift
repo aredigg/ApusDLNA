@@ -11,4 +11,12 @@ public struct Request: Sendable {
     public func header(_ name: String) -> String? {
         headers[name.lowercased()]
     }
+
+    static let empty = Request(
+        method: "",
+        path: "",
+        headers: [:],
+        body: nil,
+        remoteEndpoint: nil
+    )
 }

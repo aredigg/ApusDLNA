@@ -36,6 +36,19 @@ public struct Response: Sendable {
         .ok(str, contentType: "text/xml; charset=\"utf-8\"")
     }
 
+    public static func upnpErr(_ str: String) -> Response {
+        let data: Data = Data(str.utf8)
+        return Response(
+            code: 500,
+            reason: "Internal Server Error",
+            headers: [
+                "Content-Type": "text/xml; charset=\"utf-8\"",
+                "Content-Length": "\(data.count)",
+            ],
+            body: .data(data)
+        )
+    }
+
     public static let notFound: Response = Response(code: 404, reason: "Not Found")
     public static let badRequest: Response = Response(code: 400, reason: "Bad Request")
     public static let internalError: Response = Response(code: 500, reason: "Server Error")

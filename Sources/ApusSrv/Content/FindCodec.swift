@@ -13,14 +13,15 @@ public enum FindCodec {
         return VideoCodec(codecType: codecType)
     }
 
-    public static func audioCodec(atPath path: String) async -> FourCharCode? {
+    public static func audioCodec(atPath path: String) async -> AudioCodec? {
         let asset: AVAsset = AVURLAsset(url: URL(fileURLWithPath: path))
         guard
             let track = try? await asset.loadTracks(withMediaType: .audio).first,
             let descriptions = try? await track.load(.formatDescriptions),
             let desc = descriptions.first
         else { return nil }
-        return CMFormatDescriptionGetMediaSubType(desc)
+        let codecType: FourCharCode = CMFormatDescriptionGetMediaSubType(desc)
+        return AudioCodec(codecType: codecType)
     }
 
     public static func videoDimensions(atPath path: String) async -> (Int, Int)? {

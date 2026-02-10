@@ -8,6 +8,8 @@ public actor MediaServer {
     private let transcoder: Transcoder
     private var server: Server?
 
+    private let connectionManagerState = ConnectionManagerState()
+
     private let port: UInt16
     private var discoveryTask: Task<Void, Never>?
     private var localAddress: String = "0.0.0.0"
@@ -25,7 +27,6 @@ public actor MediaServer {
         self.content = ScanDirectory()
         self.subscriptions = SubscriptionManager()
         self.transcoder = Transcoder()
-        //        self.server = Server(port: port) { _ in .notFound }
     }
 
     public func start(path: String) async throws {
@@ -33,10 +34,10 @@ public actor MediaServer {
         self.localAddress = ip
         try await content.scan(directory: path)
         let mediaServer: MediaServer = self
-        let server: Server = Server(port: port) { request in
+        let startServer: Server = Server(port: port) { request in
             await mediaServer.route(request)
         }
-        try await server.start()
+        try await startServer.start()
         try await discovery.start()
         let events: AsyncStream<DiscoveryEvent> = await discovery.events()
         discoveryTask = Task {
@@ -46,6 +47,7 @@ public actor MediaServer {
         }
         await alive()
         print("ApusDLNA started: \(device.friendlyName)")
+        self.server = startServer
     }
 
     public func stop() async {
@@ -62,11 +64,21 @@ public actor MediaServer {
         switch (request.method.uppercased(), request.path) {
         case (_, "/description.xml"):
             return .xml(device.xml(baseURL: baseURL()))
+        case (_, "/ContentDirectory/scpd.xml"):
+            return .xml(directorySCPDXML())
         case ("POST", "/ContentDirectory/control"):
-            return await handleControl(request)
+            return await handleDirectoryControl(request)
         case ("SUBSCRIBE", "/ContentDirectory/event"):
             return await handleSubscribe(request)
         case ("UNSUBSCRIBE", "/ContentDirectory/event"):
+            return await handleUnsubscribe(request)
+        case (_, "/ConnectionManager/scpd.xml"):
+            return .xml(connectionManagerSCPDXML())
+        case ("POST", "/ConnectionManager/control"):
+            return await handleConnectionManagerControl(request)
+        case ("SUBSCRIBE", "/ConnectionManager/event"):
+            return await handleSubscribe(request)
+        case ("UNSUBSCRIBE", "/ConnectionManager/event"):
             return await handleUnsubscribe(request)
         case (_, let path) where path.hasPrefix("/m/"):
             return await handleMedia(request)
@@ -75,7 +87,7 @@ public actor MediaServer {
         }
     }
 
-    private func handleControl(_ request: Request) async -> Response {
+    private func handleDirectoryControl(_ request: Request) async -> Response {
         guard
             let header: String = request.header("soapaction"),
             let object: ObjectRequest = ObjectRequest.parse(action: header, body: request.body)
@@ -255,6 +267,11 @@ public actor MediaServer {
             .replacingOccurrences(of: "<", with: "")
             .replacingOccurrences(of: ">", with: "")
         let subscription: Subscription = await subscriptions.subscribe(callbackURL: url)
+        if request.path.hasPrefix("/ConnectionManager/") {
+            await notifyConnectionManagerEvent()
+        } else if request.path.hasPrefix("/ContentDirectory/") {
+            await notifyContentDirectoryEvent()
+        }
         return Response(
             code: 200,
             reason: "OK",
@@ -335,7 +352,7 @@ public actor MediaServer {
                         path.addingPercentEncoding(
                             withAllowedCharacters: .urlPathAllowed
                         ) ?? path
-                    let url: String = "\(baseURL())/media/\(encoded)"
+                    let url: String = "\(baseURL())/m/\(encoded)"
                     let sizeAttr: String = item.size.map { " size=\"\($0)\"" } ?? ""
                     res = """
                         <res protocolInfo="http-get:*:\(mime):*"\(sizeAttr)>\
@@ -370,6 +387,903 @@ public actor MediaServer {
         }
         xml += "</DIDL-Lite>"
         return xml
+    }
+
+    private func directorySCPDXML() -> String {
+        """
+        <?xml version="1.0" encoding="utf-8"?>
+        <scpd xmlns="urn:schemas-upnp-org:service-1-0">
+          <specVersion>
+            <major>1</major>
+            <minor>0</minor>
+          </specVersion>
+
+          <actionList>
+            <action>
+              <name>Browse</name>
+              <argumentList>
+                <argument>
+                  <name>ObjectID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>BrowseFlag</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_BrowseFlag</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>Filter</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>StartingIndex</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>RequestedCount</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>SortCriteria</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable>
+                </argument>
+
+                <argument>
+                  <name>Result</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>NumberReturned</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>TotalMatches</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>UpdateID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>GetSearchCapabilities</name>
+              <argumentList>
+                <argument>
+                  <name>SearchCaps</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>SearchCapabilities</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>GetSortCapabilities</name>
+              <argumentList>
+                <argument>
+                  <name>SortCaps</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>SortCapabilities</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>GetSystemUpdateID</name>
+              <argumentList>
+                <argument>
+                  <name>Id</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>SystemUpdateID</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>Search</name>
+              <argumentList>
+                <argument>
+                  <name>ContainerID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>SearchCriteria</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_SearchCriteria</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>Filter</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>StartingIndex</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>RequestedCount</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>SortCriteria</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable>
+                </argument>
+
+                <argument>
+                  <name>Result</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>NumberReturned</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>TotalMatches</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>UpdateID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>CreateObject</name>
+              <argumentList>
+                <argument>
+                  <name>ContainerID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>Elements</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable>
+                </argument>
+
+                <argument>
+                  <name>ObjectID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>Result</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>DestroyObject</name>
+              <argumentList>
+                <argument>
+                  <name>ObjectID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>UpdateObject</name>
+              <argumentList>
+                <argument>
+                  <name>ObjectID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>CurrentTagValue</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_TagValueList</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>NewTagValue</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_TagValueList</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>ImportResource</name>
+              <argumentList>
+                <argument>
+                  <name>SourceURI</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_URI</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>DestinationURI</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_URI</relatedStateVariable>
+                </argument>
+
+                <argument>
+                  <name>TransferID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_TransferID</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>GetTransferProgress</name>
+              <argumentList>
+                <argument>
+                  <name>TransferID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_TransferID</relatedStateVariable>
+                </argument>
+
+                <argument>
+                  <name>TransferStatus</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_TransferStatus</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>TransferLength</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_TransferLength</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>TransferTotal</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_TransferTotal</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>DeleteResource</name>
+              <argumentList>
+                <argument>
+                  <name>ResourceURI</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_URI</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>StopTransferResource</name>
+              <argumentList>
+                <argument>
+                  <name>TransferID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_TransferID</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>GetFreeStorageSpace</name>
+              <argumentList>
+                <argument>
+                  <name>StorageID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_StorageID</relatedStateVariable>
+                </argument>
+
+                <argument>
+                  <name>FreeBytes</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_FreeBytes</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>GetTotalStorageSpace</name>
+              <argumentList>
+                <argument>
+                  <name>StorageID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_StorageID</relatedStateVariable>
+                </argument>
+
+                <argument>
+                  <name>TotalBytes</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_TotalBytes</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>GetDeviceCapabilities</name>
+              <argumentList>
+                <argument>
+                  <name>PlayMedia</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_PlayMedia</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>RecMedia</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_RecMedia</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>RecQualityModes</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_RecQualityModes</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>X_GetFeatureList</name>
+              <argumentList>
+                <argument>
+                  <name>FeatureList</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+          </actionList>
+
+          <serviceStateTable>
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_ObjectID</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_Result</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_BrowseFlag</name>
+              <dataType>string</dataType>
+              <allowedValueList>
+                <allowedValue>BrowseMetadata</allowedValue>
+                <allowedValue>BrowseDirectChildren</allowedValue>
+              </allowedValueList>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_Filter</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_Index</name>
+              <dataType>ui4</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_Count</name>
+              <dataType>ui4</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_SortCriteria</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>SortCapabilities</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>SearchCapabilities</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="yes">
+              <name>SystemUpdateID</name>
+              <dataType>ui4</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="yes">
+              <name>ContainerUpdateIDs</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_SearchCriteria</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_TagValueList</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_URI</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_TransferID</name>
+              <dataType>ui4</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_TransferStatus</name>
+              <dataType>string</dataType>
+              <allowedValueList>
+                <allowedValue>COMPLETED</allowedValue>
+                <allowedValue>ERROR</allowedValue>
+                <allowedValue>IN_PROGRESS</allowedValue>
+                <allowedValue>STOPPED</allowedValue>
+              </allowedValueList>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_TransferLength</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_TransferTotal</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_StorageID</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_FreeBytes</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_PlayMedia</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_RecMedia</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_RecQualityModes</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_TotalBytes</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_UpdateID</name>
+              <dataType>ui4</dataType>
+            </stateVariable>
+          </serviceStateTable>
+        </scpd>
+        """
+    }
+
+    private func connectionManagerSCPDXML() -> String {
+        """
+        <?xml version="1.0" encoding="utf-8"?>
+        <scpd xmlns="urn:schemas-upnp-org:service-1-0">
+          <specVersion>
+            <major>1</major>
+            <minor>0</minor>
+          </specVersion>
+
+          <actionList>
+            <action>
+              <name>GetProtocolInfo</name>
+              <argumentList>
+                <argument>
+                  <name>Source</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>SourceProtocolInfo</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>Sink</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>SinkProtocolInfo</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>PrepareForConnection</name>
+              <argumentList>
+                <argument>
+                  <name>RemoteProtocolInfo</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ProtocolInfo</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>PeerConnectionManager</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ConnectionManager</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>PeerConnectionID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>Direction</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Direction</relatedStateVariable>
+                </argument>
+
+                <argument>
+                  <name>ConnectionID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>AVTransportID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_AVTransportID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>RcsID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_RcsID</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>ConnectionComplete</name>
+              <argumentList>
+                <argument>
+                  <name>ConnectionID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>GetCurrentConnectionIDs</name>
+              <argumentList>
+                <argument>
+                  <name>ConnectionIDs</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>CurrentConnectionIDs</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+
+            <action>
+              <name>GetCurrentConnectionInfo</name>
+              <argumentList>
+                <argument>
+                  <name>ConnectionID</name>
+                  <direction>in</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable>
+                </argument>
+
+                <argument>
+                  <name>RcsID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_RcsID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>AVTransportID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_AVTransportID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>ProtocolInfo</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ProtocolInfo</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>PeerConnectionManager</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ConnectionManager</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>PeerConnectionID</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>Direction</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_Direction</relatedStateVariable>
+                </argument>
+                <argument>
+                  <name>Status</name>
+                  <direction>out</direction>
+                  <relatedStateVariable>A_ARG_TYPE_ConnectionStatus</relatedStateVariable>
+                </argument>
+              </argumentList>
+            </action>
+          </actionList>
+
+          <serviceStateTable>
+            <stateVariable sendEvents="yes">
+              <name>SourceProtocolInfo</name>
+              <dataType>string</dataType>
+            </stateVariable>
+            <stateVariable sendEvents="yes">
+              <name>SinkProtocolInfo</name>
+              <dataType>string</dataType>
+            </stateVariable>
+            <stateVariable sendEvents="yes">
+              <name>CurrentConnectionIDs</name>
+              <dataType>string</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_ProtocolInfo</name>
+              <dataType>string</dataType>
+            </stateVariable>
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_ConnectionManager</name>
+              <dataType>string</dataType>
+            </stateVariable>
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_ConnectionID</name>
+              <dataType>i4</dataType>
+            </stateVariable>
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_AVTransportID</name>
+              <dataType>i4</dataType>
+            </stateVariable>
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_RcsID</name>
+              <dataType>i4</dataType>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_Direction</name>
+              <dataType>string</dataType>
+              <allowedValueList>
+                <allowedValue>Input</allowedValue>
+                <allowedValue>Output</allowedValue>
+              </allowedValueList>
+            </stateVariable>
+
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_ConnectionStatus</name>
+              <dataType>string</dataType>
+              <allowedValueList>
+                <allowedValue>OK</allowedValue>
+                <allowedValue>ContentFormatMismatch</allowedValue>
+                <allowedValue>InsufficientBandwidth</allowedValue>
+                <allowedValue>UnreliableChannel</allowedValue>
+                <allowedValue>Unknown</allowedValue>
+              </allowedValueList>
+            </stateVariable>
+          </serviceStateTable>
+        </scpd>
+        """
+    }
+
+    private func notifyConnectionManagerEvent() async {
+        let ids = await connectionManagerState.getCurrentConnectionIDsCSV()
+        let source = dlnaSourceProtocolInfoCSV()
+        let sink = ""
+
+        let eventXML = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+              <e:property><SourceProtocolInfo>\(escapeXML(source))</SourceProtocolInfo></e:property>
+              <e:property><SinkProtocolInfo>\(escapeXML(sink))</SinkProtocolInfo></e:property>
+              <e:property><CurrentConnectionIDs>\(escapeXML(ids))</CurrentConnectionIDs></e:property>
+            </e:propertyset>
+            """
+
+        await subscriptions.notify(eventXML: eventXML)
+    }
+
+    private func notifyContentDirectoryEvent() async {
+        let systemUpdateID: UInt32 = 1
+        let containerUpdateIDs: String = ""
+        let eventXML = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+              <e:property>
+                <SystemUpdateID>\(systemUpdateID)</SystemUpdateID>
+              </e:property>
+              <e:property>
+                <ContainerUpdateIDs>\(escapeXML(containerUpdateIDs))</ContainerUpdateIDs>
+              </e:property>
+            </e:propertyset>
+            """
+        await subscriptions.notify(eventXML: eventXML)
+    }
+
+    private func handleConnectionManagerControl(_ request: Request) async -> Response {
+        guard
+            let header: String = request.header("soapaction"),
+            let object: ObjectRequest = ObjectRequest.parse(action: header, body: request.body)
+        else {
+            return upnpFault(statusCode: 500, code: 402, description: "Invalid Args")
+        }
+
+        // Ensure caller is actually addressing ConnectionManager.
+        // Many clients send the correct serviceType; enforce it.
+        if object.serviceType != "urn:schemas-upnp-org:service:ConnectionManager:1" {
+            return upnpFault(statusCode: 500, code: 401, description: "Invalid Action")
+        }
+
+        switch object.actionName {
+        case "GetProtocolInfo":
+            let source = dlnaSourceProtocolInfoCSV()
+            let sink = ""  // DMS is usually not a sink
+            let body = ObjectResponse.envelope(
+                action: "GetProtocolInfo",
+                serviceType: object.serviceType,
+                arguments: [("Source", source), ("Sink", sink)]
+            )
+            return .xml(body)
+
+        case "GetCurrentConnectionIDs":
+            let ids = await connectionManagerState.getCurrentConnectionIDsCSV()
+            let body = ObjectResponse.envelope(
+                action: "GetCurrentConnectionIDs",
+                serviceType: object.serviceType,
+                arguments: [("ConnectionIDs", ids)]
+            )
+            return .xml(body)
+
+        case "GetCurrentConnectionInfo":
+            guard let idStr = object.arguments["ConnectionID"], let id = Int(idStr) else {
+                return upnpFault(statusCode: 500, code: 402, description: "Invalid Args")
+            }
+
+            if id == 0 {
+                // Per common practice: 0 is “no connection”.
+                let body = ObjectResponse.envelope(
+                    action: "GetCurrentConnectionInfo",
+                    serviceType: object.serviceType,
+                    arguments: [
+                        ("RcsID", "-1"),
+                        ("AVTransportID", "-1"),
+                        ("ProtocolInfo", ""),
+                        ("PeerConnectionManager", ""),
+                        ("PeerConnectionID", "-1"),
+                        ("Direction", "Output"),
+                        ("Status", "OK"),
+                    ]
+                )
+                return .xml(body)
+            }
+
+            guard let info = await connectionManagerState.getInfo(id: id) else {
+                return upnpFault(statusCode: 500, code: 706, description: "Invalid Connection Reference")
+            }
+
+            let body = ObjectResponse.envelope(
+                action: "GetCurrentConnectionInfo",
+                serviceType: object.serviceType,
+                arguments: [
+                    ("RcsID", "\(info.rcsID)"),
+                    ("AVTransportID", "\(info.avTransportID)"),
+                    ("ProtocolInfo", escapeXML(info.protocolInfo)),
+                    ("PeerConnectionManager", escapeXML(info.peerConnectionManager)),
+                    ("PeerConnectionID", "\(info.peerConnectionID)"),
+                    ("Direction", info.direction),
+                    ("Status", info.status),
+                ]
+            )
+            return .xml(body)
+
+        case "PrepareForConnection":
+            guard
+                let remoteProtocolInfo = object.arguments["RemoteProtocolInfo"],
+                let peerCM = object.arguments["PeerConnectionManager"],
+                let peerIDStr = object.arguments["PeerConnectionID"],
+                let peerID = Int(peerIDStr),
+                let direction = object.arguments["Direction"]
+            else {
+                return upnpFault(statusCode: 500, code: 402, description: "Invalid Args")
+            }
+
+            let info = await connectionManagerState.prepareForConnection(
+                remoteProtocolInfo: remoteProtocolInfo,
+                peerConnectionManager: peerCM,
+                peerConnectionID: peerID,
+                direction: direction
+            )
+
+            // Event: CurrentConnectionIDs changes
+            await notifyConnectionManagerEvent()
+
+            let body = ObjectResponse.envelope(
+                action: "PrepareForConnection",
+                serviceType: object.serviceType,
+                arguments: [
+                    ("ConnectionID", "\(info.id)"),
+                    ("AVTransportID", "\(info.avTransportID)"),
+                    ("RcsID", "\(info.rcsID)"),
+                ]
+            )
+            return .xml(body)
+
+        case "ConnectionComplete":
+            guard let idStr = object.arguments["ConnectionID"], let id = Int(idStr) else {
+                return upnpFault(statusCode: 500, code: 402, description: "Invalid Args")
+            }
+            _ = await connectionManagerState.connectionComplete(id: id)
+            await notifyConnectionManagerEvent()
+
+            let body = ObjectResponse.envelope(
+                action: "ConnectionComplete",
+                serviceType: object.serviceType,
+                arguments: []
+            )
+            return .xml(body)
+
+        default:
+            return upnpFault(statusCode: 500, code: 401, description: "Invalid Action")
+        }
+    }
+
+    private func dlnaSourceProtocolInfoCSV() -> String {
+        // DLNA additionalInfo is the 4th field of protocolInfo.
+        // Keep this conservative:
+        // - OP=01 => byte-range supported
+        // - CI=0  => not transcoded (this is a capability list, not per-item)
+        // - FLAGS => common superset used by many DMS implementations
+        let commonAdditionalInfo =
+            "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+
+        // MP4-only (plus images) per your constraint.
+        // Avoid advertising strict DLNA.ORG_PN for video/mp4 because your audio varies
+        // (AAC vs AC-3/E-AC-3/Atmos), and incorrect PN causes some renderers to reject.
+        let entries: [String] = [
+            "http-get:*:video/mp4:\(commonAdditionalInfo)",
+            "http-get:*:audio/mp4:\(commonAdditionalInfo)",
+            "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG;\(commonAdditionalInfo)",
+            "http-get:*:image/png:\(commonAdditionalInfo)",  // not a classic DLNA PN, but many accept
+        ]
+
+        return entries.joined(separator: ",")
+    }
+
+    private func upnpFault(statusCode: Int, code: Int, description: String) -> Response {
+        let xml = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+              s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+              <s:Body>
+                <s:Fault>
+                  <faultcode>s:Client</faultcode>
+                  <faultstring>UPnPError</faultstring>
+                  <detail>
+                    <UPnPError xmlns="urn:schemas-upnp-org:control-1-0">
+                      <errorCode>\(code)</errorCode>
+                      <errorDescription>\(escapeXML(description))</errorDescription>
+                    </UPnPError>
+                  </detail>
+                </s:Fault>
+              </s:Body>
+            </s:Envelope>
+            """
+        return .upnpErr(xml)
     }
 
     private func escapeXML(_ str: String) -> String {

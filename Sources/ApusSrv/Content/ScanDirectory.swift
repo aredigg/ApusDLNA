@@ -68,11 +68,19 @@ public actor ScanDirectory {
                 guard let mime: String = Self.matchMIME(name) else { continue }
                 let attributes: [FileAttributeKey: Any] = try fm.attributesOfItem(atPath: fullPath)
                 let size: UInt64? = attributes[.size] as? UInt64
-                var codec: VideoCodec?
+                var videoCodec: VideoCodec?
+                var audioCodec: AudioCodec?
                 var duration: Double?
+                var width: Int?
+                var height: Int?
                 if mime.hasPrefix("video") {
-                    codec = await FindCodec.videoCodec(atPath: fullPath)
+                    videoCodec = await FindCodec.videoCodec(atPath: fullPath)
+                    audioCodec = await FindCodec.audioCodec(atPath: fullPath)
                     duration = await FindCodec.duration(atPath: fullPath)
+                    let dimensions = await FindCodec.videoDimensions(atPath: fullPath)
+                    width = dimensions?.0
+                    height = dimensions?.1
+
                 }
                 let item: MediaItem = MediaItem(
                     id: id,
@@ -83,7 +91,10 @@ public actor ScanDirectory {
                     filePath: fullPath,
                     size: size,
                     duration: duration,
-                    videoCodec: codec
+                    videoCodec: videoCodec,
+                    audioCodec: audioCodec,
+                    width: width,
+                    height: height,
                 )
                 addItem(item)
             }

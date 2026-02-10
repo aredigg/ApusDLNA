@@ -48,8 +48,6 @@ public actor Transcoder {
         let frameRate = try await videoTrack.load(.nominalFrameRate)
         let dataRate = try await videoTrack.load(.estimatedDataRate)
 
-        // ── Reader ──────────────────────────────────────────────
-
         let reader = try AVAssetReader(asset: asset)
 
         let videoReaderOutput = AVAssetReaderTrackOutput(
@@ -183,8 +181,6 @@ public actor Transcoder {
         await writer.finishWriting()
     }
 
-    // MARK: - Sample pump
-
     private static func drainSamples(
         from output: AVAssetReaderTrackOutput,
         to input: AVAssetWriterInput,
@@ -209,13 +205,9 @@ public actor Transcoder {
     }
 }
 
-// MARK: - Sendable box for non-Sendable AVFoundation types
-
 private struct UncheckedBox<T>: @unchecked Sendable {
     let value: T
 }
-
-// MARK: - Segment delegate
 
 private final class SegmentDelegate:
     NSObject,
@@ -224,9 +216,7 @@ private final class SegmentDelegate:
 {
     private let continuation: AsyncStream<Data>.Continuation
 
-    init(
-        continuation: AsyncStream<Data>.Continuation
-    ) {
+    init(continuation: AsyncStream<Data>.Continuation) {
         self.continuation = continuation
     }
 

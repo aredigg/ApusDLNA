@@ -14,7 +14,8 @@ public actor SubscriptionManager {
             sid: sid,
             callbackURL: callbackURL,
             timeout: timeout,
-            createdAt: Date()
+            createdAt: Date(),
+            seq: 0
         )
         subscriptions[sid] = sub
         return sub
@@ -26,7 +27,8 @@ public actor SubscriptionManager {
             sid: subscription.sid,
             callbackURL: subscription.callbackURL,
             timeout: timeout,
-            createdAt: Date()
+            createdAt: Date(),
+            seq: subscription.seq
         )
         subscriptions[sid] = subscription
         return true
@@ -50,14 +52,24 @@ public actor SubscriptionManager {
         let active: [Subscription] = activeSubscriptions()
         for subscription: Subscription in active {
             guard let url: URL = URL(string: subscription.callbackURL) else { continue }
+            let next = subscription.seq &+ 1
+            let sid = subscription.sid
+            subscriptions[sid] = Subscription(
+                sid: sid,
+                callbackURL: subscription.callbackURL,
+                timeout: subscription.timeout,
+                createdAt: subscription.createdAt,
+                seq: next
+            )
             var request: URLRequest = URLRequest(url: url)
             request.httpMethod = "NOTIFY"
             request.setValue("text/xml", forHTTPHeaderField: "Content-Type")
             request.setValue("upnp:event", forHTTPHeaderField: "NT")
             request.setValue("upnp:propchange", forHTTPHeaderField: "NTS")
             request.setValue(subscription.sid, forHTTPHeaderField: "SID")
+            request.setValue("\(next)", forHTTPHeaderField: "SEQ")
             request.httpBody = Data(eventXML.utf8)
-            // try? await URLSession.shared.data(for: request)
+            _ = try? await URLSession.shared.data(for: request)
         }
     }
 }
