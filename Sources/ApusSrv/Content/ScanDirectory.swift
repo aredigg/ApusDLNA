@@ -6,13 +6,13 @@ public actor ScanDirectory {
 
     public init() {
         let root: MediaItem = MediaItem(
-            id: "Root",
+            id: "0",
             parentID: "None",
             title: "Root",
             isContainer: true
         )
-        items["Root"] = root
-        children["Root"] = []
+        items["0"] = root
+        children["0"] = []
     }
 
     public func addItem(_ item: MediaItem) {
@@ -47,7 +47,7 @@ public actor ScanDirectory {
         items[id]
     }
 
-    public func scan(directory: String, parentID: String = "Root") async throws {
+    public func scan(directory: String, parentID: String = "0") async throws {
         let fm: FileManager = FileManager.default
         let contents: [String] = try fm.contentsOfDirectory(atPath: directory)
         for name: String in contents.sorted() {
@@ -96,7 +96,6 @@ public actor ScanDirectory {
                     width: width,
                     height: height,
                 )
-                print(item)
                 addItem(item)
             }
         }

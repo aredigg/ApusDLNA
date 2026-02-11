@@ -6,13 +6,28 @@ public actor Discovery {
     private let host: NWEndpoint.Host = "239.255.255.250"
     private let port: NWEndpoint.Port = 1900
     private let queue: DispatchQueue = DispatchQueue(label: "com.jackalworks.apus-media.discovery")
-    private var continuation: AsyncStream<DiscoveryEvent>.Continuation?
+    private var continuations: [UUID: AsyncStream<DiscoveryEvent>.Continuation] = [:]
 
     public init() {}
 
     public func events() -> AsyncStream<DiscoveryEvent> {
         AsyncStream { continuation in
-            self.continuation = continuation
+            let id: UUID = UUID()
+            continuations[id] = continuation
+
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeContinuation(id: id) }
+            }
+        }
+    }
+
+    private func removeContinuation(id: UUID) {
+        continuations[id] = nil
+    }
+
+    private func yield(_ event: DiscoveryEvent) {
+        for continuation in continuations.values {
+            continuation.yield(event)
         }
     }
 
@@ -35,8 +50,10 @@ public actor Discovery {
     public func stop() {
         connectionGroup?.cancel()
         connectionGroup = nil
-        continuation?.finish()
-        continuation = nil
+        for continuation in continuations.values {
+            continuation.finish()
+        }
+        continuations.removeAll()
     }
 
     public func alive(usn: String, location: String, server: String, nt: String) {
@@ -52,7 +69,6 @@ public actor Discovery {
             \r
             """
         send(message: message)
-        print("\u{001B}[35malive:\n\(message)\u{001B}[0m")
     }
 
     public func byebye(usn: String, nt: String) {
@@ -65,7 +81,6 @@ public actor Discovery {
             \r
             """
         send(message: message)
-        print("\u{001B}[35mbyebye:\n\(message)\u{001B}[0m")
     }
 
     public func sendResponse(to endpoint: NWEndpoint, usn: String, location: String, server: String, st: String) {
@@ -86,12 +101,10 @@ public actor Discovery {
             content: response.data(using: .utf8),
             completion: .contentProcessed({ _ in connection.cancel() })
         )
-        print("\u{001B}[34msendResponse:\n\(response)\u{001B}[0m")
     }
 
     private func handleMessage(_ data: Data, from message: NWConnectionGroup.Message) {
         guard let str: String = String(data: data, encoding: .utf8) else { return }
-        print("\u{001B}[31mhandleMessage:\n\(str)\u{001B}[0m")
         guard str.uppercased().hasPrefix("M-SEARCH") else { return }
         let lines: [String] = str.components(separatedBy: "\r\n")
         var st: String?
@@ -106,12 +119,10 @@ public actor Discovery {
             }
         }
         guard let target: String = st, let endpoint: NWEndpoint = message.remoteEndpoint else { return }
-        continuation?.yield(.searchReceived(st: target, from: endpoint))
-        print("\u{001B}[32mM-Search \(target) \(endpoint)\u{001B}[0m")
+        yield(.searchReceived(st: target, from: endpoint))
     }
 
     private func send(message: String) {
-        print("\u{001B}[33msend:\n\(message)\u{001B}[0m")
         guard let data: Data = message.data(using: .utf8) else { return }
         connectionGroup?.send(content: data) { error in
             if let error { print("Discovery send: \(error)") }

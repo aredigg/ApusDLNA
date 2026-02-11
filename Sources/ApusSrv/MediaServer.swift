@@ -9,6 +9,7 @@ public actor MediaServer {
     private var server: Server?
 
     private let connectionManagerState = ConnectionManagerState()
+    private var aliveTask: Task<Void, Never>?
 
     private let port: UInt16
     private var discoveryTask: Task<Void, Never>?
@@ -46,11 +47,22 @@ public actor MediaServer {
             }
         }
         await alive()
+        aliveTask?.cancel()
+        aliveTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(900))
+                if Task.isCancelled { break }
+                await self.alive()
+            }
+        }
         print("ApusDLNA started: \(device.friendlyName)")
         self.server = startServer
     }
 
     public func stop() async {
+        aliveTask?.cancel()
+        aliveTask = nil
         await bye()
         discoveryTask?.cancel()
         discoveryTask = nil
@@ -127,10 +139,10 @@ public actor MediaServer {
     }
 
     private func handleBrowse(_ object: ObjectRequest) async -> Response {
-        let objectID: String = object.arguments["ObjectID"] ?? "Root"
+        let objectID: String = object.arguments["ObjectID"] ?? "0"
         let flag: String = object.arguments["BrowseFlag"] ?? "BrowseDirectChildren"
-        let start: Int = Int(object.arguments["StartingIndex"] ?? "Root") ?? 0
-        let count: Int = Int(object.arguments["RequestedCount"] ?? "Root") ?? 0
+        let start: Int = Int(object.arguments["StartingIndex"] ?? "0") ?? 0
+        let count: Int = Int(object.arguments["RequestedCount"] ?? "0") ?? 0
 
         let (items, total) = await content.browse(
             objectID: objectID,
@@ -154,10 +166,21 @@ public actor MediaServer {
     }
 
     private func handleMedia(_ request: Request) async -> Response {
-        let path: String = String(request.path.dropFirst("/m/".count))
+        let token: String = String(request.path.dropFirst("/m/".count))
+
+        let paddedToken: String = {
+            let base64: String =
+                token
+                .replacingOccurrences(of: "-", with: "+")
+                .replacingOccurrences(of: "_", with: "/")
+            let paddingCount: Int = (4 - (base64.count % 4)) % 4
+            return base64 + String(repeating: "=", count: paddingCount)
+        }()
+
         guard
-            let decoded: String = path.removingPercentEncoding,
-            let item: MediaItem = await content.item(for: decoded),
+            let decoded: Data = Data(base64Encoded: paddedToken),
+            let itemID: String = String(data: decoded, encoding: .utf8),
+            let item: MediaItem = await content.item(for: itemID),
             let filePath: String = item.filePath
         else {
             return .notFound
@@ -173,9 +196,9 @@ public actor MediaServer {
                 code: 200,
                 reason: "OK",
                 headers: [
-                    "Content-Type": "video/mp4",
-                    "Transfer-Encoding": "chunked",
-                    "transferMode.dlna.org": "Streaming",
+                    "content-type": "video/mp4",
+                    "transfer-encoding": "chunked",
+                    "transfermode.dlna.org": "Streaming",
                 ],
                 body: .stream(stream)
             )
@@ -205,10 +228,10 @@ public actor MediaServer {
                 code: 206,
                 reason: "Partial Content",
                 headers: [
-                    "Content-Type": mimeType,
-                    "Content-Length": "\(length)",
-                    "Content-Range": "bytes \(range.start)-\(range.end)/\(fileSize)",
-                    "Accept-Ranges": "bytes",
+                    "content-type": mimeType,
+                    "content-length": "\(length)",
+                    "content-range": "bytes \(range.start)-\(range.end)/\(fileSize)",
+                    "accept-ranges": "bytes",
                 ],
                 body: .data(data)
             )
@@ -224,8 +247,13 @@ public actor MediaServer {
                 var empty: Bool = false
                 while !empty {
                     let chunk: Data = streamHandle.readData(ofLength: 256 * 1024)
-                    continuation.yield(chunk)
-                    empty = chunk.isEmpty
+                    if chunk.isEmpty {
+                        empty = chunk.isEmpty
+                    } else {
+                        continuation.yield(chunk)
+
+                    }
+
                 }
                 continuation.finish()
             }
@@ -235,28 +263,41 @@ public actor MediaServer {
             code: 200,
             reason: "OK",
             headers: [
-                "Content-Type": mimeType,
-                "Content-Length": "\(fileSize)",
-                "Accept-Ranges": "bytes",
+                "content-type": mimeType,
+                "accept-ranges": "bytes",
             ],
             body: .stream(stream)
         )
     }
 
     private func parseRange(_ header: String, fileSize: UInt64) -> (start: UInt64, end: UInt64)? {
-        guard header.hasPrefix("bytes=") else { return nil }
-        let spec: String.SubSequence = header.dropFirst("bytes=".count)
-        let parts: [String.SubSequence] = spec.split(separator: "-")
-        guard let startStr: String.SubSequence = parts.first,
-            let start: UInt64 = UInt64(startStr)
-        else { return nil }
-        let end: UInt64
-        if parts.count > 1, let e: UInt64 = UInt64(parts[1]) {
-            end = min(e, fileSize - 1)
-        } else {
-            end = fileSize - 1
+        guard fileSize > 0 else { return nil }
+        guard header.trimmingCharacters(in: .whitespaces).hasPrefix("bytes=") else { return nil }
+        let spec = header.dropFirst("bytes=".count)
+        let specs = spec.split(separator: ",", omittingEmptySubsequences: true)
+        guard specs.count == 1 else { return nil }
+        let rangeSpec = specs[0].trimmingCharacters(in: .whitespaces)
+
+        let bounds: [String.SubSequence] = rangeSpec.split(
+            separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard bounds.count == 2 else { return nil }
+        if !bounds[0].isEmpty {
+            guard let start: UInt64 = UInt64(bounds[0]) else { return nil }
+            let end: UInt64
+            if bounds[1].isEmpty {
+                end = fileSize - 1
+            } else {
+                guard let requestedEnd: UInt64 = UInt64(bounds[1]) else { return nil }
+                end = min(requestedEnd, fileSize - 1)
+            }
+            guard start <= end else { return nil }
+            return (start, end)
         }
-        guard start <= end else { return nil }
+        guard !bounds[1].isEmpty, let suffixLength: UInt64 = UInt64(bounds[1]) else { return nil }
+        if suffixLength == 0 { return nil }
+        let length: UInt64 = min(suffixLength, fileSize)
+        let start: UInt64 = fileSize - length
+        let end: UInt64 = fileSize - 1
         return (start, end)
     }
 
@@ -276,8 +317,8 @@ public actor MediaServer {
             code: 200,
             reason: "OK",
             headers: [
-                "SID": subscription.sid,
-                "TIMEOUT": "Second-\(Int(subscription.timeout))",
+                "sid": subscription.sid,
+                "timeout": "second-\(Int(subscription.timeout))",
             ]
         )
     }
@@ -300,9 +341,14 @@ public actor MediaServer {
                 "uuid:\(device.uuid)",
             ]
             guard targets.contains(st) else { return }
+            let baseUSN: String = "uuid:\(device.uuid)"
+            let usn: String = {
+                if st.lowercased().hasPrefix("uuid:") { return baseUSN }
+                return "\(baseUSN)::\(st)"
+            }()
             await discovery.sendResponse(
                 to: from,
-                usn: "uuid:\(device.uuid)",
+                usn: usn,
                 location: "\(baseURL())/description.xml",
                 server: device.serverHeader,
                 st: st
@@ -311,23 +357,69 @@ public actor MediaServer {
     }
 
     private func alive() async {
-        await discovery.alive(
-            usn: "uuid:\(device.uuid)",
-            location: "\(baseURL())/description.xml",
-            server: device.serverHeader,
-            nt: "upnp:rootdevice"
-        )
+        let location: String = "\(baseURL())/description.xml"
+        let server: String = device.serverHeader
+        let baseUSN: String = "uuid:\(device.uuid)"
+
+        let announcements: [(nt: String, usn: String)] = [
+            ("upnp:rootdevice", "\(baseUSN)::upnp:rootdevice"),
+            ("uuid:\(device.uuid)", baseUSN),
+            ("urn:schemas-upnp-org:device:MediaServer:1", "\(baseUSN)::urn:schemas-upnp-org:device:MediaServer:1"),
+            (
+                "urn:schemas-upnp-org:service:ContentDirectory:1",
+                "\(baseUSN)::urn:schemas-upnp-org:service:ContentDirectory:1"
+            ),
+            (
+                "urn:schemas-upnp-org:service:ConnectionManager:1",
+                "\(baseUSN)::urn:schemas-upnp-org:service:ConnectionManager:1"
+            ),
+        ]
+
+        for announcement in announcements {
+            await discovery.alive(
+                usn: announcement.usn,
+                location: location,
+                server: server,
+                nt: announcement.nt
+            )
+        }
     }
 
     private func bye() async {
-        await discovery.byebye(
-            usn: "uuid:\(device.uuid)",
-            nt: "upnp:rootdevice"
-        )
+        let baseUSN: String = "uuid:\(device.uuid)"
+
+        let announcements: [(nt: String, usn: String)] = [
+            ("upnp:rootdevice", "\(baseUSN)::upnp:rootdevice"),
+            ("uuid:\(device.uuid)", baseUSN),
+            ("urn:schemas-upnp-org:device:MediaServer:1", "\(baseUSN)::urn:schemas-upnp-org:device:MediaServer:1"),
+            (
+                "urn:schemas-upnp-org:service:ContentDirectory:1",
+                "\(baseUSN)::urn:schemas-upnp-org:service:ContentDirectory:1"
+            ),
+            (
+                "urn:schemas-upnp-org:service:ConnectionManager:1",
+                "\(baseUSN)::urn:schemas-upnp-org:service:ConnectionManager:1"
+            ),
+        ]
+
+        for announcement in announcements {
+            await discovery.byebye(usn: announcement.usn, nt: announcement.nt)
+        }
     }
 
     private func baseURL() -> String {
         "http://\(localAddress):\(port)"
+    }
+
+    private func mediaURL(for itemID: String) -> String {
+        let data: Data = Data(itemID.utf8)
+        let base64: String = data.base64EncodedString()
+        let base64url: String =
+            base64
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "\(baseURL())/m/\(base64url)"
     }
 
     private func buildMetadata(items: [MediaItem]) -> String {
@@ -347,16 +439,11 @@ public actor MediaServer {
                     """
             } else {
                 let res: String
-                if let mime = item.mimeType, let path = item.filePath {
-                    let encoded: String =
-                        path.addingPercentEncoding(
-                            withAllowedCharacters: .urlPathAllowed
-                        ) ?? path
-                    let url: String = "\(baseURL())/m/\(encoded)"
+                if let mime = item.mimeType {
+                    let url: String = mediaURL(for: item.id)
                     let sizeAttr: String = item.size.map { " size=\"\($0)\"" } ?? ""
                     res = """
-                        <res protocolInfo="http-get:*:\(mime):*"\(sizeAttr)>\
-                        \(escapeXML(url))</res>
+                        <res protocolInfo="http-get:*:\(mime):*"\(sizeAttr)>\(escapeXML(url))</res>
                         """
                 } else {
                     res = ""

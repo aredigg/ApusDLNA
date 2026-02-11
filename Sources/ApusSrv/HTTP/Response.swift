@@ -17,6 +17,7 @@ public struct Response: Sendable {
         self.reason = reason
         self.headers = headers
         self.body = body
+
     }
 
     public static func ok(_ str: String, contentType: String = "text/plain") -> Response {
@@ -25,8 +26,8 @@ public struct Response: Sendable {
             code: 200,
             reason: "OK",
             headers: [
-                "Content-Type": contentType,
-                "Content-Length": "\(data.count)",
+                "content-type": contentType,
+                "content-length": "\(data.count)",
             ],
             body: .data(data)
         )
@@ -42,8 +43,8 @@ public struct Response: Sendable {
             code: 500,
             reason: "Internal Server Error",
             headers: [
-                "Content-Type": "text/xml; charset=\"utf-8\"",
-                "Content-Length": "\(data.count)",
+                "content-type": "text/xml; charset=\"utf-8\"",
+                "content-length": "\(data.count)",
             ],
             body: .data(data)
         )

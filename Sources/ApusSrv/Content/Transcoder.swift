@@ -32,7 +32,6 @@ public actor Transcoder {
         continuation: AsyncStream<Data>
             .Continuation
     ) async throws {
-        print("performTranscode")
         let asset = AVURLAsset(url: inputURL)
 
         guard

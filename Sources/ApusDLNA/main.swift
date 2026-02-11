@@ -4,7 +4,7 @@ import Foundation
 struct ApusDLNAMain {
     static func main() async throws {
         let mediaServer: MediaServer = MediaServer(friendlyName: "Media Server")
-        try await mediaServer.start(path: ".")
+        try await mediaServer.start(path: "/Volumes/Delt/Gammelt/春雨Rainns")
         signal(SIGINT, SIG_IGN)
         let sigint: any DispatchSourceSignal = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         sigint.resume()
