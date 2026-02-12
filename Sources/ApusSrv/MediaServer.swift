@@ -46,7 +46,10 @@ public actor MediaServer {
                 await mediaServer.handleDiscoveryEvent(event)
             }
         }
-        await alive()
+        for _ in 0..<3 {
+            await alive()
+            try? await Task.sleep(for: .milliseconds(200))
+        }
         aliveTask?.cancel()
         aliveTask = Task { [weak self] in
             guard let self else { return }
@@ -63,7 +66,10 @@ public actor MediaServer {
     public func stop() async {
         aliveTask?.cancel()
         aliveTask = nil
-        await bye()
+        for _ in 0..<3 {
+            await bye()
+            try? await Task.sleep(for: .milliseconds(200))
+        }
         discoveryTask?.cancel()
         discoveryTask = nil
         await discovery.stop()
@@ -211,61 +217,64 @@ public actor MediaServer {
     }
 
     private func serveFile(path: String, mimeType: String, request: Request) async -> Response {
-        guard let handle: FileHandle = FileHandle(forReadingAtPath: path) else {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+            let fileSize = attributes[.size] as? UInt64
+        else {
             return .notFound
         }
-        defer { try? handle.close() }
-        let fileSize: UInt64 = handle.seekToEndOfFile()
-        handle.seek(toFileOffset: 0)
+        var startOffset: UInt64 = 0
+        var length: UInt64 = fileSize
+        var statusCode = 200
+        var reason = "OK"
+        var contentRange: String? = nil
         if let rangeHeader = request.header("range"),
             let range = parseRange(rangeHeader, fileSize: fileSize)
         {
-            handle.seek(toFileOffset: range.start)
-            let length = range.end - range.start + 1
-            let data = handle.readData(ofLength: Int(length))
-
-            return Response(
-                code: 206,
-                reason: "Partial Content",
-                headers: [
-                    "content-type": mimeType,
-                    "content-length": "\(length)",
-                    "content-range": "bytes \(range.start)-\(range.end)/\(fileSize)",
-                    "accept-ranges": "bytes",
-                ],
-                body: .data(data)
-            )
+            startOffset = range.start
+            length = range.end - range.start + 1
+            statusCode = 206
+            reason = "Partial Content"
+            contentRange = "bytes \(range.start)-\(range.end)/\(fileSize)"
         }
-
-        let stream: AsyncStream<Data> = AsyncStream<Data> { continuation in
-            Task.detached {
-                guard let streamHandle: FileHandle = FileHandle(forReadingAtPath: path) else {
-                    continuation.finish()
-                    return
-                }
-                defer { try? streamHandle.close() }
-                var empty: Bool = false
-                while !empty {
-                    let chunk: Data = streamHandle.readData(ofLength: 256 * 1024)
-                    if chunk.isEmpty {
-                        empty = chunk.isEmpty
-                    } else {
-                        continuation.yield(chunk)
-
-                    }
-
-                }
+        let (stream, continuation) = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingOldest(32))
+        var remaining: UInt64 = length
+        Task.detached {
+            guard let fileHandle = FileHandle(forReadingAtPath: path) else {
                 continuation.finish()
+                return
             }
+            defer { try? fileHandle.close() }
+            try? fileHandle.seek(toOffset: startOffset)
+            let bufferSize = 256 * 1024
+            while remaining > 0 {
+                if Task.isCancelled { break }
+                let chunkSize = min(remaining, UInt64(bufferSize))
+                let chunk = fileHandle.readData(ofLength: Int(chunkSize))
+                if chunk.isEmpty { break }
+                let result = continuation.yield(chunk)
+                switch result {
+                case .terminated, .dropped:
+                    return
+                case .enqueued:
+                    break
+                @unknown default:
+                    break
+                }
+                remaining -= UInt64(chunk.count)
+                try? await Task.sleep(for: .microseconds(100))
+            }
+            continuation.finish()
         }
-
+        var headers: [String: String] = [
+            "content-type": mimeType,
+            "content-length": "\(length)",
+            "accept-ranges": "bytes",
+        ]
+        if let contentRange { headers["content-range"] = contentRange }
         return Response(
-            code: 200,
-            reason: "OK",
-            headers: [
-                "content-type": mimeType,
-                "accept-ranges": "bytes",
-            ],
+            code: statusCode,
+            reason: reason,
+            headers: headers,
             body: .stream(stream)
         )
     }
@@ -302,6 +311,18 @@ public actor MediaServer {
     }
 
     private func handleSubscribe(_ request: Request) async -> Response {
+        if let sid = request.header("sid") {
+            let renewed = await subscriptions.renew(sid: sid)
+            guard renewed else { return .preconditionFailed }
+            return Response(
+                code: 200,
+                reason: "OK",
+                headers: [
+                    "sid": sid,
+                    "timeout": "second-1800",
+                ]
+            )
+        }
         guard let callback: String = request.header("callback") else { return .badRequest }
         let url: String =
             callback
@@ -441,9 +462,24 @@ public actor MediaServer {
                 let res: String
                 if let mime = item.mimeType {
                     let url: String = mediaURL(for: item.id)
+                    let durationAttr: String
+                    if let duration = item.duration {
+                        let durationStr = Duration.seconds(duration).formatted(
+                            .time(pattern: .hourMinuteSecond(padHourToLength: 1, fractionalSecondsLength: 3)))
+                        durationAttr = " duration=\"\(durationStr)\""
+                    } else {
+                        durationAttr = ""
+                    }
+                    let resolutionAttr: String = {
+                        if let w = item.width, let h = item.height {
+                            return " resolution=\"\(w)x\(h)\""
+                        }
+                        return ""
+                    }()
                     let sizeAttr: String = item.size.map { " size=\"\($0)\"" } ?? ""
+                    let dlnaFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
                     res = """
-                        <res protocolInfo="http-get:*:\(mime):*"\(sizeAttr)>\(escapeXML(url))</res>
+                        <res protocolInfo="http-get:*:\(mime):\(dlnaFlags)"\(sizeAttr)\(durationAttr)\(resolutionAttr)>\(escapeXML(url))</res>
                         """
                 } else {
                     res = ""
@@ -1374,10 +1410,17 @@ public actor MediaServer {
     }
 
     private func escapeXML(_ str: String) -> String {
-        str
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
+        var result = ""
+        result.reserveCapacity(str.count)
+        for c in str {
+            switch c {
+            case "&": result += "&amp;"
+            case "<": result += "&lt;"
+            case ">": result += "&gt;"
+            default: result.append(c)
+            }
+        }
+        return result
     }
 
     private func escapeXMLAttr(_ str: String) -> String {

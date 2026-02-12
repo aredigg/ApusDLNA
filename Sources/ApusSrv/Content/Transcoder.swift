@@ -6,50 +6,73 @@ public actor Transcoder {
 
     public init() {}
 
-    public func transcode(
-        path: String,
-        codec: VideoCodec
-    ) -> AsyncStream<Data> {
+    public func transcode(path: String, codec: VideoCodec) -> AsyncStream<Data> {
         let inputURL = URL(fileURLWithPath: path)
-        let (stream, continuation) =
-            AsyncStream<Data>.makeStream()
-
+        let context = TranscodeContext()
+        let (stream, continuation) = AsyncStream<Data>.makeStream()
+        continuation.onTermination = { @Sendable _ in
+            context.cancel()
+        }
         Task.detached(priority: .userInitiated) {
-            try await Self.performTranscode(
-                from: inputURL,
-                codec: codec,
-                continuation: continuation
-            )
-            continuation.finish()
+            defer { continuation.finish() }
+            do {
+                try await Self.performTranscode(
+                    from: inputURL,
+                    codec: codec,
+                    continuation: continuation,
+                    context: context
+                )
+            } catch {
+                print("Transcode failed: \(error)")
+            }
         }
 
         return stream
     }
 
+    private final class TranscodeContext: @unchecked Sendable {
+        private var writer: AVAssetWriter?
+        private var reader: AVAssetReader?
+        private var isCancelled = false
+        private let lock = NSLock()
+        func capture(writer: AVAssetWriter, reader: AVAssetReader) {
+            lock.lock()
+            defer { lock.unlock() }
+            self.writer = writer
+            self.reader = reader
+            if isCancelled {
+                writer.cancelWriting()
+                reader.cancelReading()
+            }
+        }
+        func cancel() {
+            lock.lock()
+            defer { lock.unlock() }
+            isCancelled = true
+            writer?.cancelWriting()
+            reader?.cancelReading()
+        }
+    }
+
     private static func performTranscode(
         from inputURL: URL,
         codec: VideoCodec,
-        continuation: AsyncStream<Data>
-            .Continuation
+        continuation: AsyncStream<Data>.Continuation,
+        context: TranscodeContext
     ) async throws {
         let asset = AVURLAsset(url: inputURL)
-
         guard
             let videoTrack =
                 try await asset
                 .loadTracks(withMediaType: .video).first
         else { return }
-
         let audioTrack =
             try? await asset
             .loadTracks(withMediaType: .audio).first
-
         let naturalSize = try await videoTrack.load(.naturalSize)
         let frameRate = try await videoTrack.load(.nominalFrameRate)
         let dataRate = try await videoTrack.load(.estimatedDataRate)
-
         let reader = try AVAssetReader(asset: asset)
-
         let videoReaderOutput = AVAssetReaderTrackOutput(
             track: videoTrack,
             outputSettings: [
@@ -59,7 +82,6 @@ public actor Transcoder {
         )
         videoReaderOutput.alwaysCopiesSampleData = false
         reader.add(videoReaderOutput)
-
         var audioReaderOutput: AVAssetReaderTrackOutput?
         if let audioTrack {
             let aro = AVAssetReaderTrackOutput(
@@ -76,7 +98,6 @@ public actor Transcoder {
             reader.add(aro)
             audioReaderOutput = aro
         }
-
         let segmentDelegate = SegmentDelegate(
             continuation: continuation
         )
@@ -88,7 +109,6 @@ public actor Transcoder {
             preferredTimescale: 600
         )
         writer.initialSegmentStartTime = .zero
-
         let targetBitRate: Int =
             switch codec {
             case .av01:
@@ -98,7 +118,6 @@ public actor Transcoder {
             default:
                 0
             }
-
         let videoWriterInput = AVAssetWriterInput(
             mediaType: .video,
             outputSettings: [
@@ -116,7 +135,6 @@ public actor Transcoder {
         )
         videoWriterInput.expectsMediaDataInRealTime = false
         writer.add(videoWriterInput)
-
         var audioWriterInput: AVAssetWriterInput?
         if audioReaderOutput != nil {
             let awi = AVAssetWriterInput(
@@ -132,22 +150,23 @@ public actor Transcoder {
             writer.add(awi)
             audioWriterInput = awi
         }
-
-        reader.startReading()
-        print(reader.error.debugDescription)
-        writer.startWriting()
-        print(writer.error.debugDescription)
+        context.capture(writer: writer, reader: reader)
+        guard reader.startReading() else {
+            print("Reader failed to start: \(reader.error.debugDescription)")
+            return
+        }
+        guard writer.startWriting() else {
+            print("Writer failed to start: \(writer.error.debugDescription)")
+            return
+        }
         writer.startSession(atSourceTime: .zero)
-
         let queue = DispatchQueue(
             label: "com.jackalworks.apus-media.transcoder",
             qos: .userInitiated
         )
-
         let videoPair = UncheckedBox(
             value: (videoReaderOutput, videoWriterInput)
         )
-
         let audioPair:
             UncheckedBox<
                 (AVAssetReaderTrackOutput, AVAssetWriterInput)
@@ -159,7 +178,6 @@ public actor Transcoder {
                 } else {
                     nil
                 }
-
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
                 await Self.drainSamples(
@@ -168,7 +186,6 @@ public actor Transcoder {
                     on: queue
                 )
             }
-
             if let audioPair {
                 group.addTask {
                     await Self.drainSamples(
@@ -178,10 +195,8 @@ public actor Transcoder {
                     )
                 }
             }
-
             await group.waitForAll()
         }
-
         await writer.finishWriting()
     }
 

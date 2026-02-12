@@ -50,8 +50,9 @@ public struct Response: Sendable {
         )
     }
 
-    public static let notFound: Response = Response(code: 404, reason: "Not Found")
     public static let badRequest: Response = Response(code: 400, reason: "Bad Request")
+    public static let notFound: Response = Response(code: 404, reason: "Not Found")
+    public static let preconditionFailed: Response = Response(code: 412, reason: "Precondition Failed")
     public static let internalError: Response = Response(code: 500, reason: "Server Error")
 
 }

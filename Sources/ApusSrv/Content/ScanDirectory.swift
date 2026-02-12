@@ -1,17 +1,18 @@
+import AVFoundation
 import Foundation
 
 public actor ScanDirectory {
     private var items: [String: MediaItem] = [:]
     private var children: [String: [String]] = [:]
+    private let maxConcurrentTasks = 32
 
     public init() {
-        let root: MediaItem = MediaItem(
+        items["0"] = MediaItem(
             id: "0",
             parentID: "None",
             title: "Root",
             isContainer: true
         )
-        items["0"] = root
         children["0"] = []
     }
 
@@ -32,10 +33,11 @@ public actor ScanDirectory {
             }
             return ([], 0)
         }
-        let childIDs: [String] = children[objectID] ?? []
-        let total: Int = childIDs.count
-        let count: Int = requestedCount == 0 ? total : requestedCount
-        let slice: [MediaItem] =
+        let childIDs = children[objectID] ?? []
+        let total = childIDs.count
+        let count = requestedCount == 0 ? total : requestedCount
+        guard startIndex < total else { return ([], total) }
+        let slice =
             childIDs
             .dropFirst(startIndex)
             .prefix(count)
@@ -48,57 +50,111 @@ public actor ScanDirectory {
     }
 
     public func scan(directory: String, parentID: String = "0") async throws {
-        let fm: FileManager = FileManager.default
-        let contents: [String] = try fm.contentsOfDirectory(atPath: directory)
-        for name: String in contents.sorted() {
-            let fullPath: String = (directory as NSString).appendingPathComponent(name)
+        let fm = FileManager.default
+        let contents = try fm.contentsOfDirectory(atPath: directory).sorted()
+        var filesToProcess: [String] = []
+        for name in contents {
+            if name.hasPrefix(".") { continue }
+            let fullPath = (directory as NSString).appendingPathComponent(name)
             var isDir: ObjCBool = false
-            fm.fileExists(atPath: fullPath, isDirectory: &isDir)
-            let id: String = fullPath
-            if isDir.boolValue {
-                let folder: MediaItem = MediaItem(
-                    id: id,
-                    parentID: parentID,
-                    title: name,
-                    isContainer: true
-                )
-                addItem(folder)
-                try await scan(directory: fullPath, parentID: id)
-            } else {
-                guard let mime: String = Self.matchMIME(name) else { continue }
-                let attributes: [FileAttributeKey: Any] = try fm.attributesOfItem(atPath: fullPath)
-                let size: UInt64? = attributes[.size] as? UInt64
-                var videoCodec: VideoCodec?
-                var audioCodec: AudioCodec?
-                var duration: Double?
-                var width: Int?
-                var height: Int?
-                if mime.hasPrefix("video") {
-                    videoCodec = await FindCodec.videoCodec(atPath: fullPath)
-                    audioCodec = await FindCodec.audioCodec(atPath: fullPath)
-                    duration = await FindCodec.duration(atPath: fullPath)
-                    let dimensions = await FindCodec.videoDimensions(atPath: fullPath)
-                    width = dimensions?.0
-                    height = dimensions?.1
-
+            if fm.fileExists(atPath: fullPath, isDirectory: &isDir) {
+                if isDir.boolValue {
+                    let folder = MediaItem(
+                        id: fullPath,
+                        parentID: parentID,
+                        title: name,
+                        isContainer: true
+                    )
+                    addItem(folder)
+                    try await scan(directory: fullPath, parentID: fullPath)
+                } else {
+                    filesToProcess.append(name)
                 }
-                let item: MediaItem = MediaItem(
-                    id: id,
-                    parentID: parentID,
-                    title: name,
-                    isContainer: false,
-                    mimeType: mime,
-                    filePath: fullPath,
-                    size: size,
-                    duration: duration,
-                    videoCodec: videoCodec,
-                    audioCodec: audioCodec,
-                    width: width,
-                    height: height,
-                )
-                addItem(item)
             }
         }
+        await withTaskGroup(of: MediaItem?.self) { group in
+            var activeTasks = 0
+            for name in filesToProcess {
+                let fullPath = (directory as NSString).appendingPathComponent(name)
+                if activeTasks >= maxConcurrentTasks {
+                    if let item = await group.next() {
+                        if let item { addItem(item) }
+                    }
+                    activeTasks -= 1
+                }
+                group.addTask {
+                    return await Self.analyzeFile(
+                        path: fullPath,
+                        name: name,
+                        parentID: parentID
+                    )
+                }
+                activeTasks += 1
+            }
+            while let item = await group.next() {
+                if let item { addItem(item) }
+            }
+        }
+    }
+
+    private static func analyzeFile(path: String, name: String, parentID: String) async -> MediaItem? {
+        let fm = FileManager.default
+        guard let mime = Self.matchMIME(name) else { return nil }
+        let attributes = try? fm.attributesOfItem(atPath: path)
+        let size = attributes?[.size] as? UInt64
+        var videoCodec: VideoCodec?
+        var audioCodec: AudioCodec?
+        var duration: Double?
+        var width: Int?
+        var height: Int?
+        if mime.hasPrefix("video") || mime.hasPrefix("audio") {
+            let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+            do {
+                if let dur = try? await asset.load(.duration) {
+                    let seconds = CMTimeGetSeconds(dur)
+                    if seconds.isFinite && seconds > 0 {
+                        duration = seconds
+                    }
+                }
+                let tracks = try await asset.load(.tracks)
+                if let videoTrack = tracks.first(where: { $0.mediaType == .video }) {
+                    if let size = try? await videoTrack.load(.naturalSize) {
+                        width = Int(size.width)
+                        height = Int(size.height)
+                    }
+                    if let descriptions = try? await videoTrack.load(.formatDescriptions),
+                        let desc = descriptions.first
+                    {
+                        let codecType = CMFormatDescriptionGetMediaSubType(desc)
+                        videoCodec = VideoCodec(codecType: codecType)
+                    }
+                }
+                if let audioTrack = tracks.first(where: { $0.mediaType == .audio }) {
+                    if let descriptions = try? await audioTrack.load(.formatDescriptions),
+                        let desc = descriptions.first
+                    {
+                        let codecType = CMFormatDescriptionGetMediaSubType(desc)
+                        audioCodec = AudioCodec(codecType: codecType)
+                    }
+                }
+            } catch {
+                print("Failed to probe asset at \(path): \(error)")
+            }
+        }
+        return MediaItem(
+            id: path,
+            parentID: parentID,
+            title: name,
+            isContainer: false,
+            mimeType: mime,
+            filePath: path,
+            size: size,
+            duration: duration,
+            videoCodec: videoCodec,
+            audioCodec: audioCodec,
+            width: width,
+            height: height
+        )
     }
 
     private static func matchMIME(_ filename: String) -> String? {

@@ -17,24 +17,20 @@ public actor Server {
 
     public func start() throws {
         guard listener == nil else { return }
-        let listener: NWListener = try NWListener(using: .tcp, on: port)
+        let listener = try NWListener(using: .tcp, on: port)
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
             connection.start(queue: self.queue)
             Task { await self.accept(connection) }
         }
         listener.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                print("Server listening on port \(listener.port ?? 0)")
-            case .failed(let error):
+            if case .failed(let error) = state {
                 print("Server listener failed: \(error)")
-            default:
-                break
             }
         }
         listener.start(queue: queue)
         self.listener = listener
+        print("Server listening on port \(port)")
     }
 
     public func stop() {
@@ -44,21 +40,26 @@ public actor Server {
     }
 
     private func accept(_ connection: NWConnection) async {
-        var complete: Bool = false
-        do {
-            while !complete {
-                let (data, isComplete) = try await readOnce(from: connection)
-                if let data: Data, !data.isEmpty {
-                    if let response: Response = await processData(data, from: connection) {
-                        let isHead: Bool = parseMethod(for: connection)?.uppercased() == "HEAD"
-                        await send(response: response, isHead: isHead, on: connection)
-                        return
-                    }
-                }
-                complete = isComplete
+        var keepAlive = true
+        while keepAlive {
+            if let (response, method) = await processData(Data(), from: connection) {
+                keepAlive = await send(response: response, method: method, on: connection)
+                continue
             }
-        } catch {
-            print("accept error")
+            do {
+                let (data, isComplete) = try await readOnce(from: connection)
+                if isComplete {
+                    keepAlive = false
+                    break
+                }
+                guard let data, !data.isEmpty else { continue }
+                if let (response, method) = await processData(data, from: connection) {
+                    keepAlive = await send(response: response, method: method, on: connection)
+                }
+            } catch {
+                print("Connection error: \(error)")
+                keepAlive = false
+            }
         }
         close(connection)
     }
@@ -76,71 +77,57 @@ public actor Server {
         })
     }
 
-    private func processData(_ data: Data, from connection: NWConnection) async -> Response? {
-        let connectionID: ObjectIdentifier = ObjectIdentifier(connection)
-        var buffer: Data = buffers[connectionID] ?? Data()
-        buffer.append(data)
-        buffers[connectionID] = buffer
-
-        let separatorData: Data = Data("\r\n\r\n".utf8)
-        guard let separatorRange: Range<Data.Index> = buffer.range(of: separatorData) else {
-            return nil
+    private func processData(_ data: Data, from connection: NWConnection) async -> (Response, String)? {
+        let id: ObjectIdentifier = ObjectIdentifier(connection)
+        var buffer = buffers[id] ?? Data()
+        if !data.isEmpty {
+            buffer.append(data)
+            buffers[id] = buffer
         }
-
+        let separatorData: Data = Data("\r\n\r\n".utf8)
+        guard let separatorRange = buffer.range(of: separatorData) else { return nil }
         let headerEndIndex: Int = separatorRange.upperBound
         let headerData: Data = buffer[..<headerEndIndex]
-
-        guard let headerString: String = String(data: headerData, encoding: .utf8) else {
-            buffers[connectionID] = nil
-            return .badRequest
+        guard let headerString = String(data: headerData, encoding: .utf8),
+            let requestLine = headerString.components(separatedBy: "\r\n").first
+        else {
+            buffers[id] = nil
+            return (.badRequest, "GET")
         }
-
-        let headerLines: [String] = headerString.components(separatedBy: "\r\n")
-        guard let requestLine: String = headerLines.first else {
-            buffers[connectionID] = nil
-            return .badRequest
-        }
-
-        let requestLineParts: [Substring] = requestLine.split(separator: " ")
+        let requestLineParts = requestLine.split(separator: " ")
         guard requestLineParts.count >= 2 else {
-            buffers[connectionID] = nil
-            return .badRequest
+            buffers[id] = nil
+            return (.badRequest, "GET")
         }
-
+        let method = String(requestLineParts[0])
+        let path = String(requestLineParts[1])
         var headers: [String: String] = [:]
-        headers.reserveCapacity(headerLines.count)
-
-        for line: String in headerLines.dropFirst() {
-            let keyValue: [Substring] = line.split(separator: ":", maxSplits: 1)
-            guard keyValue.count == 2 else { continue }
-            let key: String = String(keyValue[0]).trimmingCharacters(in: .whitespaces).lowercased()
-            let value: String = String(keyValue[1]).trimmingCharacters(in: .whitespaces)
-            headers[key] = value
+        let headerLines = headerString.components(separatedBy: "\r\n").dropFirst()
+        for line in headerLines {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            if parts.count == 2 {
+                headers[parts[0].trimmingCharacters(in: .whitespaces).lowercased()] =
+                    parts[1].trimmingCharacters(in: .whitespaces)
+            }
         }
-
-        let contentLength: Int = Int(headers["content-length"] ?? "") ?? 0
-        let totalBytesNeeded: Int = headerEndIndex + max(contentLength, 0)
-
-        guard buffer.count >= totalBytesNeeded else {
-            return nil
-        }
-
-        let bodyData: Data? =
+        let contentLength = Int(headers["content-length"] ?? "") ?? 0
+        let totalBytesNeeded = headerEndIndex + max(contentLength, 0)
+        guard buffer.count >= totalBytesNeeded else { return nil }
+        let bodyData =
             contentLength > 0
             ? buffer[headerEndIndex..<headerEndIndex + contentLength]
             : nil
-
-        let remoteEndpoint: NWEndpoint? = connection.currentPath?.remoteEndpoint
-        let request: Request = Request(
-            method: String(requestLineParts[0]),
-            path: String(requestLineParts[1]),
+        let request = Request(
+            method: method,
+            path: path,
             headers: headers,
             body: bodyData,
-            remoteEndpoint: remoteEndpoint
+            remoteEndpoint: connection.currentPath?.remoteEndpoint
         )
-        let remaining: Data = buffer.dropFirst(totalBytesNeeded)
-        buffers[connectionID] = remaining.isEmpty ? nil : remaining
-        return await handler(request)
+        let remaining = buffer.dropFirst(totalBytesNeeded)
+        buffers[id] = remaining.isEmpty ? nil : remaining
+        let response = await handler(request)
+        return (response, method)
     }
 
     private func parseMethod(for connection: NWConnection) -> String? {
@@ -152,35 +139,49 @@ public actor Server {
         return firstLine.split(separator: " ").first.map(String.init)
     }
 
-    private func send(response: Response, isHead: Bool, on connection: NWConnection) async {
-        let headerData: Data = serializeHeaders(for: response)
-        await writeBytes(headerData, to: connection)
-        guard !isHead else {
-            close(connection)
-            return
-        }
-        switch response.body {
-        case .empty:
-            break
-        case .data(let data):
-            await writeBytes(data, to: connection)
-        case .stream(let stream):
-            for await chunk in stream where !chunk.isEmpty {
-                let prefix = Data(String(format: "%X\r\n", chunk.count).utf8)
-                await writeBytes(prefix, to: connection)
-                await writeBytes(chunk, to: connection)
-                await writeBytes(Data("\r\n".utf8), to: connection)
+    private func send(response: Response, method: String, on connection: NWConnection) async -> Bool {
+        let (headerData, shouldKeepAlive) = serializeHeaders(for: response)
+        guard await writeBytes(headerData, to: connection) else { return false }
+        let isHead = method.uppercased() == "HEAD"
+        if !isHead {
+            switch response.body {
+            case .empty:
+                break
+            case .data(let data):
+                guard await writeBytes(data, to: connection) else { return false }
+            case .stream(let stream):
+                let isChunked =
+                    response.headers["transfer-encoding"]?
+                    .lowercased().contains("chunked") ?? false
+                for await chunk in stream {
+                    if chunk.isEmpty { continue }
+                    if isChunked {
+                        let prefix = Data(String(format: "%X\r\n", chunk.count).utf8)
+                        guard await writeBytes(prefix, to: connection) else { return false }
+                        guard await writeBytes(chunk, to: connection) else { return false }
+                        guard await writeBytes(Data("\r\n".utf8), to: connection) else { return false }
+                    } else {
+                        guard await writeBytes(chunk, to: connection) else { return false }
+                    }
+                }
+                if isChunked {
+                    guard await writeBytes(Data("0\r\n\r\n".utf8), to: connection) else { return false }
+                }
             }
-            await writeBytes(Data("0\r\n\r\n".utf8), to: connection)
         }
-        close(connection)
+        return shouldKeepAlive
     }
 
-    private func writeBytes(_ data: Data, to connection: NWConnection) async {
-        await withCheckedContinuation({ (continuation: CheckedContinuation<Void, Never>) in
-            connection.send(content: data, completion: .contentProcessed({ _ in continuation.resume() }))
-        })
-
+    private func writeBytes(_ data: Data, to connection: NWConnection) async -> Bool {
+        guard !data.isEmpty else { return true }
+        return await withCheckedContinuation { continuation in
+            connection.send(
+                content: data,
+                completion: .contentProcessed { error in
+                    continuation.resume(returning: error == nil)
+                }
+            )
+        }
     }
 
     private func close(_ connection: NWConnection) {
@@ -189,36 +190,36 @@ public actor Server {
 
     }
 
-    private func serializeHeaders(for response: Response) -> Data {
-        var headers: [String: String] = [:]
-        headers.reserveCapacity(response.headers.count)
-        for (key, value) in response.headers {
-            headers[key.lowercased()] = value
+    private func serializeHeaders(for response: Response) -> (Data, Bool) {
+        var normalizedHeaders: [String: String] = [:]
+        for (key, value) in response.headers { normalizedHeaders[key.lowercased()] = value }
+        let connectionVal = normalizedHeaders["connection"]?.lowercased()
+        let shouldKeepAlive = connectionVal != "close"
+        if normalizedHeaders["connection"] == nil {
+            normalizedHeaders["connection"] = "keep-alive"
         }
-        var lines: [String] = [String]()
-        lines.append("HTTP/1.1 \(response.statusCode) \(response.reason)")
-        lines.append("Date: \(Date().formatted(.http))")
-        lines.append("Connection: close")
-
         switch response.body {
         case .empty:
-            if headers["content-length"] == nil {
-                headers["content-length"] = "0"
+            if normalizedHeaders["content-length"] == nil {
+                normalizedHeaders["content-length"] = "0"
             }
         case .data(let data):
-            if headers["content-length"] == nil {
-                headers["content-length"] = "\(data.count)"
+            if normalizedHeaders["content-length"] == nil {
+                normalizedHeaders["content-length"] = "\(data.count)"
             }
         case .stream:
-            if headers["transfer-encoding"] == nil {
-                headers["transfer-encoding"] = "chunked"
+            if normalizedHeaders["transfer-encoding"] == nil
+                && normalizedHeaders["content-length"] == nil
+            {
+                normalizedHeaders["transfer-encoding"] = "chunked"
             }
         }
-        for (key, value) in headers {
+        var lines = ["HTTP/1.1 \(response.statusCode) \(response.reason)"]
+        lines.append("Date: \(Date().formatted(.http))")
+        for (key, value) in normalizedHeaders {
             lines.append("\(key): \(value)")
         }
-        lines.append("")
-        lines.append("")
-        return Data(lines.joined(separator: "\r\n").utf8)
+        lines.append("\r\n")
+        return (Data(lines.joined(separator: "\r\n").utf8), shouldKeepAlive)
     }
 }
